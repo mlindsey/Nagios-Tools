@@ -1,0 +1,483 @@
+#!/usr/bin/python -u
+# -*- coding: ascii -*-
+"""Nagios stat sharing client."""
+
+from platform import python_version
+import pwd
+import sys
+import os
+import simplejson
+import time
+import difflib
+import traceback
+import pprint
+import socket
+from copy import deepcopy
+from inspect import getframeinfo
+import socket
+
+try:
+    # asdb easy query routines
+    import asdb
+except:
+    pass
+
+from optparse import OptionParser
+
+depth = 0
+
+reports = {'hostgroup_svc': 'report hostgroup_svc $$ current_state',
+            'hostgroup_svc_ok': 'report hostgroup_svc $$ current_state 0',
+            'hostgroup_svc_warn': 'report hostgroup_svc $$ current_state 1',
+            'hostgroup_svc_crit': 'report hostgroup_svc $$ current_state 2',
+            'hostgroup_svc_unkn': 'report hostgroup_svc $$ current_state 3',
+            'hostgroup_svc_problem': 'report hostgroup_svc_prob $$ current_state',
+            'hostgroup_svc_active_warn': 'report hostgroup_svc $$ current_state 1',
+            'hostgroup_svc_active_crit': 'report hostgroup_svc $$ current_state 2',
+            'hostgroup_svc_active_unkn': 'report hostgroup_svc $$ current_state 3',
+            'hostgroup_svc_active': 'report hostgroup_svc_prob $$ current_state',
+            'hostgroup_svc_minituple': 'report hostgroup_svc_count $$ current_state',
+            'hostgroup_svc_count': 'report hostgroup_svc_count $$',
+            'netapp_usage_report': 'report hostgroup_svc_prob netapp current_state'}
+
+for age in ['m15', 'm30', 'm60', 'd1', 'd2', 'd7', 'd7gt']:
+    reports['hostgroup_svc_warn_age_%s' % (age)] = 'report hostgroup_svc $$ current_state 1'
+    reports['hostgroup_svc_crit_age_%s' % (age)] = 'report hostgroup_svc $$ current_state 2'
+    reports['hostgroup_svc_unkn_age_%s' % (age)] = 'report hostgroup_svc $$ current_state 3'
+    reports['hostgroup_svc_active_age_%s' % (age)] = 'report hostgroup_svc_prob $$ current_state'
+    reports['hostgroup_svc_problem_age_%s' % (age)] = 'report hostgroup_svc_prob $$ current_state'
+
+states = {'host': { 0: 'UP',
+                    1: 'DOWN',
+                    2: 'UNREACHABLE',
+                    'UP': 0,
+                    'DOWN': 1,
+                    'UNREACHABLE': 2},
+        'service': { 0: 'OK',
+                     1: 'WARNING',
+                     2: 'CRITICAL',
+                     3: 'UNKNOWN',
+                    'OK': 0,
+                    'WARNING': 1,
+                    'CRITICAL': 2,
+                    'UNKNOWN': 3} }
+
+
+def funcname(enter=True, forceverbose=False):
+    """Display function name of parent function"""
+    #try:
+    global depth
+    if forceverbose or options.verbose:
+    
+            if enter:
+                sys.stderr.write("%s>>DEBUG start - %s()\n" % \
+                        (depth * '.', sys._getframe(1).f_code.co_name))
+                depth += 1
+            else:
+                depth -= 1
+                sys.stderr.write("%s>>DEBUG end   - %s()\n" % \
+                        (depth * '.', sys._getframe(1).f_code.co_name))
+
+def init():
+    global options
+    """collect option information, display help text if needed, set up debugging"""
+    parser = OptionParser()
+    default = {}
+    help = {}
+    help_strings = ['server', 'Port', 'query', 'report']
+    default['server'] = 'nagios.domain.com'
+    default['Port'] = 8667
+    default['query'] = None
+    default['report'] = None
+    help['server'] = 'Server to query stats from.\n'
+    help['server'] += 'Default = %s' % (default['server'])
+    help['Port'] = 'Port to use.\n'
+    help['Port'] += 'Default = %s' % (default['Port'])
+    help['query'] = 'Raw query to pass in, or subquery if running a report.\n'
+    help['query'] += 'Default = %s' % (default['query'])
+    help['report'] = 'Report to pass in, empty string for list of available reports.\n'
+    help['report'] += 'Default = %s' % (default['report'])
+    
+    for str in help_strings:
+        parser.add_option("-%s" % (str[0]), "--%s" % (str), type="string", dest=str,
+                                default=default[str], help=help[str])
+    parser.add_option("-p", "--pretty", action="store_true", dest="pretty",
+                            default=False,
+                            help="Pretty Print output, otherwise output is JSON.")
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose",
+                            default=False,
+                            help="print debug messages to stderr")
+    # Leaving this commented out until finished.
+    #parser.add_option("--csv", action="store_true", dest="csv",
+    #                        default=False,
+    #                        help="CSV output instead of JSON output.")
+    #parser.add_option("--sep", type="string", dest="sep",
+    #                        default=',',
+    #                        help="Alternate CSV seperator character.")
+    (options, args) = parser.parse_args()
+    if options.verbose:
+        sys.stderr.write(">>DEBUG sys.argv[0] running in " +
+                                "debug mode\n")
+    funcname(True, options.verbose)
+    error = False
+
+    if options.query is None and options.report is None:
+        error = True
+        print "Must pass one of --query or --report"
+    if options.report is not None and options.report not in reports:
+        print "'%s' not a valid report." % (options.report)
+        print "Report list:"
+        reportkeys = reports.keys()
+        reportkeys.sort()
+        for report in reportkeys:
+            print "%s - %s" % (report.ljust(30), reports[report])
+        sys.exit(0)
+        
+    if error:
+        parser.print_help()
+        sys.exit(0)
+    funcname(False, options.verbose)
+    return options
+
+def seconds_to_hms(seconds):
+    """Takes a number of seconds and returns it as #h#m#s"""
+    seconds = int(seconds)
+    hour = seconds / 3600
+    minute = (seconds % 3600) / 60
+    second = seconds % 60
+    return "%sh %sm" % (hour, minute)
+
+
+def process_report(input, subquery=None):
+    """Dump out CMDB Portal JSON table output."""
+    if options.pretty:
+        print "[%.2f] Entering report func" % (time.time())
+    colors = {'0': '#00FF00', '1': '#FFFF00', '2': '#FF0000', '3': '#FF00FF'}
+    bolds = {True: 'yes', False: 'no'}
+    states = {'0': 'OK', '1': 'Warning', '2': 'Critical', '3': 'Unknown'}
+    statustype = {'0': 2, '1': 4, '3': 8, '2': 16}
+    ages = [900, 1800, 3600, 86400, 172800, 604800]
+    ageindex = ['m15', 'm30', 'm60', 'd1', 'd2', 'd7', 'd7gt']
+    urls = {}
+    # Make this configurable
+    urls['nagext']      = 'https://nagios.domain.com/nagios/cgi-bin/extinfo.cgi?'
+    urls['nagstat']     = 'https://nagios.domain.com/nagios/cgi-bin/status.cgi?'
+    urls['jira']        = 'https://jira.domain.com/browse/'
+    urls['drill']       = '/portal/monitoring_drilldown/?hostgroup=%s&state=%s'
+    urls['drillage']    = '/portal/monitoring_age_drilldown/?hostgroup=%s&state=%s&age=%s'
+    if options.report.startswith('hostgroup_svc') and \
+            options.report != 'hostgroup_svc_count':
+        output = {'header': [{'name': 'Product', 'type': 'string'},
+                            {'name': 'Host', 'type': 'string'},
+                            {'name': 'Service', 'type': 'string'},
+                            {'name': 'Ack/DT', 'type': 'string'},
+                            {'name': 'Duration', 'type': 'number'},
+                            {'name': 'Owner', 'type': 'string'},
+                            {'name': 'Ticket', 'type': 'number'},
+                            {'name': 'Priority', 'type': 'number'},
+                            {'name': 'Output', 'type': 'string'}],
+                'rows': []}
+        single = False
+        if options.report == 'hostgroup_svc':
+            statelist = ['2', '1', '3', '0']
+        elif options.report.startswith('hostgroup_svc_ok'):
+            statelist = ['0.0']
+            single = True
+        elif options.report.startswith('hostgroup_svc_warn') or \
+                options.report == 'hostgroup_svc_active_warn':
+            statelist = ['1.0']
+            single = True
+        elif options.report.startswith('hostgroup_svc_crit') or \
+                options.report == 'hostgroup_svc_active_crit':
+            statelist = ['2.0']
+            single = True
+        elif options.report.startswith('hostgroup_svc_unkn') or \
+                options.report == 'hostgroup_svc_active_unkn':
+            statelist = ['3.0']
+            single = True
+        elif options.report.startswith('hostgroup_svc_problem') or \
+                options.report.startswith('hostgroup_svc_active'):
+            statelist = ['2', '1', '3']
+        elif options.report == 'hostgroup_svc_minituple':
+            # This report format differs significantly from the
+            # others, so it gets special treatment.
+            rows = []
+            span = '<span style="color: #%s;">%s</span>'
+            for state in ['2', '1', '3']:
+                color = colors[state][1:]
+                color2 = "#" + color
+                value = '%s' % (input[state])
+                link = urls['drill'] % (subquery, states[state][:4].lower())
+                rows.append([{'value': states[state]},{'value': value, 'link': link, 'color': color2}])
+            rows.append([{'value':'OK'},{'value': input['0'],
+                                        'color': colors['0']}])
+            return {'rows': rows}
+
+
+        for state in statelist:
+            if options.pretty:
+                print "[%.2f] in statelist loop for %s" % (time.time(), state)
+            if not single:
+                input_list = input[state]
+                state = str(int(float(state)))
+                input_keys = input[state].keys()
+            else:
+                input_list = input
+                state = str(int(float(state)))
+                input_keys = input.keys()
+            try:
+                input_keys.remove('query_ok')
+            except:
+                pass
+            x = 0
+            for duration in input_keys:
+                input_keys[x] = float(duration)
+                input_list[float(duration)] = input_list[duration]
+                del input_list[duration]
+                x += 1
+            if 'age' in options.report:
+                input_keys = input_keys + ages
+                age = options.report.split('_')[4]
+            input_keys.sort()
+            if 'age' in options.report:
+                if ageindex.index(age) < 5:
+                    input_keys = input_keys[:input_keys.index(ages[ageindex.index(age)])]
+                if ageindex.index(age) > 0:
+                    input_keys = input_keys[input_keys.index(ages[ageindex.index(age)-1])+1:]
+            for duration in input_keys:
+                if duration == 'query_ok':
+                    continue
+                entry = input_list[duration]
+                link = urls['nagext']
+                link1 = '%stype=1&host=%s' % (link, entry['host'])
+                link2 = '%stype=2&host=%s&service=%s' % (link, entry['host'], entry['service'].replace(' ','+'))
+                AckDT = '[ '
+                if entry['ack'] > 0:
+                    AckDT += 'A '
+                if entry['downtime'] > 0:
+                    AckDT += 'D '
+                if 'active' in options.report and AckDT != '[ ':
+                    continue
+                AckDT += ']'
+                now = time.time()
+                try:
+                    product = asdb.get_product_by_hostname(entry['host'])
+                    linkp = 'https://nagios.domain.com/nagios/cgi-bin/status.cgi?'
+                    linkp += 'hostgroup=%s&style=detail' % (product)
+                except:
+                    product = ''
+                    linkp = ''
+                if options.pretty:
+                    print "[%.2f] took %s for asdb query" % (time.time(), time.time() - now)
+                if entry['ticket'] is not None:
+                    url = urls['jira'] + entry['ticket']
+                    entry['ticket'] = '<a href=%s>%s</a>' % (url, entry['ticket'])
+                else:
+                    entry['ticket'] = ''
+                    entry['owner'] = ''
+                    entry['priority'] = ''
+                rowdata = [{'value': product, 'color': colors[state], 'link': linkp},
+                        {'value': entry['host'].replace('.domain.com', ''), \
+                                'color': colors[state], \
+                                'link': link1},
+                        {'value': entry['service'], 'color': colors[state], 'link': link2},
+                        {'value': AckDT, 'color': colors[state]},
+                        {'value': seconds_to_hms(entry['duration']), 'color': colors[state]},
+                        {'value': entry['owner'], 'color': colors[state]},
+                        {'value': entry['ticket'], 'color': colors[state]},
+                        {'value': entry['priority'], 'color': colors[state]},
+                        {'value': entry['output'], 'color': colors[state]}]
+                output['rows'].append(rowdata)
+    elif options.report == 'hostgroup_svc_count':
+        output = {'header': [{'name': 'Total'},
+                    {'name': 'active'},
+                    {'name': '<15m'},
+                    {'name': '<30m'},
+                    {'name': '<60m'},
+                    {'name': '<24h'},
+                    {'name': '<2d'},
+                    {'name': '<7d'},
+                    {'name': '>7d'}],
+                'rows': []}
+        row = 0
+        totals = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+        for state in ['2', '1', '3']:
+            link = urls['drill']
+            link2 = urls['drillage']
+            col = 0
+            output['rows'].append([])
+            output['rows'][row].append({'value': '%s' % (input['current_state'][state]), 'color': colors[state], \
+                    'link': link % (subquery, states[state][:4].lower())})
+            totals[col] += int(input['current_state'][state])
+            col += 1
+            output['rows'][row].append({'value': '%s' % (input['unhandled'][state]), 'color': colors[state], \
+                    'link': link % (subquery, 'active_%s' % (states[state][:4].lower()))})
+            totals[col] += int(input['unhandled'][state])
+            col += 1
+            durations = input['duration'][state]
+            # add break points
+            for breaks in ages:
+                durations.append(breaks)
+            durations.sort()
+            
+            for breaks in ages:
+                age = ageindex[ages.index(breaks)]
+                output['rows'][row].append({'value': durations.index(breaks), 'color': colors[state], \
+                        'link': link2 % (subquery, states[state][:4].lower(), age)})
+                totals[col] += int(durations.index(breaks))
+                col += 1
+                durations = durations[durations.index(breaks)+1::]
+
+            output['rows'][row].append({'value': len(durations), 'color': colors[state], \
+                    'link': link2 % (subquery, states[state][:4].lower(), 'd7gt')})
+            totals[col] += int(len(durations))
+            row += 1
+        output['rows'].append([])
+        output['rows'][row].append({'value': '%s' % (totals[0]), 'color': '#BBBBBB', \
+                'link': link % (subquery, 'problem')})
+        output['rows'][row].append({'value': '%s' % (totals[1]), 'color': '#BBBBBB', \
+                'link': link % (subquery, 'active')})
+        for col in [2,3,4,5,6,7]:
+            output['rows'][row].append({'value': '%s' % (totals[col]), 'color': '#BBBBBB', \
+                    'link': link2 % (subquery, 'problem', ageindex[ages.index(ages[col-2])])})
+            
+        output['rows'][row].append({'value': '%s' % (totals[8]), 'color': '#BBBBBB', \
+                'link': link2 % (subquery, 'problem', 'd7gt')})
+
+        row += 1
+        state = '0'
+        output['rows'].append([])
+        output['rows'][row].append({'value': '%s' % (input['current_state'][state]), 'color': colors[state]})
+        output['rows'][row] += ['','','','','','','','']
+    elif options.report == 'hostgroup_svc_minituple':
+        link = 'https://nagios.domain.com/nagios/cgi-bin/status.cgi?'
+        link += 'hostgroup=%s&style=detail&servicestatustypes=%s'
+        output = {'rows': [[{'value': '('},
+                            {'value': '%s' % (input['0']), 'color': colors['0'], \
+                                    'link': link % (subquery, 2)},
+                            {'value': '/'},
+                            {'value': '%s' % (input['1']), 'color': colors['1'], \
+                                    'link': link % (subquery, 4)},
+                            {'value': '/'},
+                            {'value': '%s' % (input['2']), 'color': colors['2'], \
+                                    'link': link % (subquery, 8)},
+                            {'value': '/'},
+                            {'value': '%s' % (input['3']), 'color': colors['3'], \
+                                    'link': link % (subquery, 16)},
+                            {'value': ')'}]]}
+    elif options.report == 'netapp_usage_report':
+        output = {'header': [{'name': 'Netapp', 'type': 'string'},
+                {'name': 'Duration', 'type': 'number'},
+                {'name': 'Output', 'type': 'string'}], 'rows': []}
+        row = 0
+        for state in ['2', '1', '3']:
+            state_keys = input[state].keys()
+            state_keys.sort()
+            for duration in state_keys:
+                entry = input[state][duration]
+                rowdata = [{'value': entry['host'].rstrip('.domain.com'),
+                                'color': colors[state],
+                                'type': 'string'},
+                        {'value': seconds_to_hms(entry['duration']), 'color': colors[state], \
+                                'type': 'number'},
+                        {'value': entry['output'], 'color': colors[state], 'type': 'string'}]
+                output['rows'].append(rowdata)
+    else:
+        output = input
+    return output
+
+def connect_and_query(query):
+    """Connect to the server, and run the query.  Return the results"""
+    sock = socket.socket()
+    try:
+        sock.connect((options.server, int(options.Port)))
+    except:
+        if options.pretty:
+            print "Error connecting to server!"
+        else:
+            print simplejson.dumps({'rows': [{'value': 'Error connecting to Stats server.'}]})
+        sys.exit(0)
+    if options.pretty:
+        print "[%.2f] Connected to Server" % (time.time())
+    #if options.report:
+    #    if options.query is not None:
+    #        subquery = options.query
+    #        options.query = reports[options.report].replace('$$',options.query)
+    #    else:
+    #        subquery = None
+    #        options.query = reports[options.report]
+    sock.send('%s\n' % (options.query))
+    try:
+        package_size = int(sock.recv(24))
+    except:
+        print "Error getting package size."
+        sys.exit(0)
+    if options.pretty:
+        print "[%.2f] Receiving %i byte package" % (time.time(), package_size),
+    output = ''
+    if package_size > 1024:
+        packet = 1024
+    else:
+        packet = package_size
+    recieved = 0
+    left = package_size
+    while len(output) < package_size:
+        if options.pretty:
+            sys.stdout.write('.')
+        output += sock.recv(packet)
+        left = left - packet
+        recieved += packet
+    if options.pretty:
+        print
+    if len(output) != package_size and options.pretty:
+        print "Expected %s byte package, got %s bytes." % (package_size, len(output))
+    output = simplejson.loads(output)
+    if options.pretty:
+        print "[%.2f] Deserialized payload" % (time.time())
+    if 'query_ok' not in output:
+        if options.pretty:
+            print "Transfer failed, no 'query_ok' key, keys: %s" % (output.keys())
+        else:
+            print simplejson.dumps({'rows': [{'value': "Transfer failed, no 'query_ok' key, keys: %s" % 
+                    (output.keys())}]})
+    else:
+        if output['query_ok'] is not True:
+            output['rows'] = [{'value': '%s...' % (output['status'][:100])}]
+            del output['status']
+            if options.pretty:
+                print "[%.2f] Transfer finished (Query Failed)" % (time.time())
+                pprint.pprint(output)
+            else:
+                print simplejson.dumps(output)
+            sys.exit(2)
+    if options.pretty:
+        print "[%.2f] Transfer finished" % (time.time())
+    del output['query_ok']
+    return output
+
+if __name__ == '__main__':
+    options = init()
+    if options.report:
+        if options.query is not None:
+            subquery = options.query
+            options.query = reports[options.report].replace('$$',options.query)
+        else:
+            subquery = None
+            options.query = reports[options.report]
+    if options.verbose:
+        print options.query
+    output = connect_and_query(options.query)
+    if options.report:
+        output = process_report(output, subquery)
+        if options.pretty:
+            print "[%.2f] Report Munged" % (time.time())
+    if options.pretty:
+        if len(str(output)) > 4096 and not options.report:
+            print "[%.2f] Output too large, just printing keys" % (time.time())
+            x = simplejson.dumps(output)
+            pprint.pprint(output.keys())
+        else:
+            pprint.pprint(output)
+        print "[%.2f] Finished." % (time.time())
+    else:
+        sys.stdout.write(simplejson.dumps(output))

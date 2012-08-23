@@ -1,0 +1,782 @@
+#!/usr/bin/python -u
+# -*- coding: ascii -*-
+"""Nagios stat sharing daemon."""
+
+from platform import python_version
+import pwd
+import random
+import time
+import sys
+import os
+import simplejson
+import time
+import difflib
+import traceback
+import pprint
+import socket
+import SocketServer
+from copy import deepcopy
+from inspect import getframeinfo
+from thread import allocate_lock
+import threading
+
+major, minor = python_version().split('.')[0:2]
+pyver = float('%s.%s' % (major, minor))
+
+from optparse import OptionParser
+
+# Global, so we don't need to reread the file each time.
+object = {}
+object_index = {}
+object_lock = allocate_lock()
+status = {}
+status_index = {}
+status_lock = allocate_lock()
+report = {}
+report_lock = allocate_lock()
+tickets = {}
+tickets_lock = allocate_lock()
+perf = {'object': {'min': 0.0, 'max': 0.0},
+        'status': {},
+        'report': {},
+        'tickets': {}}
+perf_lock = allocate_lock()
+
+# track function depth
+depth = 0
+
+states = {'host': { 0: 'UP',
+                    1: 'DOWN',
+                    2: 'UNREACHABLE',
+                    'UP': 0,
+                    'DOWN': 1,
+                    'UNREACHABLE': 2},
+        'service': { 0: 'OK',
+                     1: 'WARNING',
+                     2: 'CRITICAL',
+                     3: 'UNKNOWN',
+                    'OK': 0,
+                    'WARNING': 1,
+                    'CRITICAL': 2,
+                    'UNKNOWN': 3} }
+
+# Color hash
+color = {}
+
+def funcname(enter=True, forceverbose=False):
+    """Display function name of parent function"""
+    #try:
+    global depth
+    if forceverbose or options.verbose:
+    
+            if enter:
+                sys.stderr.write("%s>>DEBUG start - %s()\n" % (depth * '.', sys._getframe(1).f_code.co_name))
+                depth += 1
+            else:
+                depth -= 1
+                sys.stderr.write("%s>>DEBUG end   - %s()\n" % (depth * '.', sys._getframe(1).f_code.co_name))
+    #except NameError:
+        # options does not exist.
+    #    return
+
+def init():
+    global options
+    """collect option information, display help text if needed, set up debugging"""
+    parser = OptionParser()
+    default = {}
+    help = {}
+    help_strings = ['object', 'status', 'cmdspool']
+    help_integer = ['Port', 'min_refresh']
+    default['status'] = '/usr/local/nagios/var/status/status.dat'
+    default['object'] = '/usr/local/nagios/var/objects.cache'
+    default['cmdspool'] = '/usr/local/nagios/var/spool/nagios.cmd' 
+    default['Port'] = 8667
+    default['min_refresh'] = 60
+    help['status'] = 'Full path to Nagios status file.\n'
+    help['status'] += 'Default = %s' % (default['status'])
+    help['object'] = 'Full path to Nagios object.cache file.\n'
+    help['object'] += 'Default = %s' % (default['object'])
+    help['cmdspool'] = 'Full path to Nagios spool file.\n'
+    help['cmdspool'] += 'Default = %s' % (default['cmdspool'])
+    help['Port'] = 'TCP Port to bind to.\n'
+    help['Port'] += 'Default = %s' % (default['Port'])
+    help['min_refresh'] = 'Seconds to wait between refreshes.\n'
+    help['min_refresh'] += 'Default = %s' % (default['min_refresh'])
+    
+    for str in help_strings:
+        parser.add_option("-%s" % (str[0]), "--%s" % (str), type="string", dest=str,
+                                default=default[str], help=help[str])
+    for str in help_integer:
+        parser.add_option("-%s" % (str[0]), "--%s" % (str), type="int", dest=str,
+                                default=default[str], help=help[str])
+    parser.add_option("-V", "--verify", action="store_true", dest="verify",
+                            default=False,
+                            help="Don't bind to TCP port, just verify.")
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose",
+                            default=False,
+                            help="print debug messages to stderr")
+    (options, args) = parser.parse_args()
+    if options.verbose:
+        sys.stderr.write(">>DEBUG sys.argv[0] running in " +
+                                "debug mode\n")
+    funcname(True, options.verbose)
+    error = False
+    if not os.path.exists(options.object):
+        error = True
+        print "Object Cache file does not exist at '%s'" % (options.object)
+    if error:
+        parser.print_help()
+    funcname(False, options.verbose)
+    return options
+
+def return_object(type, refresh=True, type_name=None, keys=[]):
+    """returns dict object of matched nagios object.
+     type is the type of object to query.  contact, service, host, etc
+     refresh:  If true, reload the cache if it's newer than current.
+     type_name is mapped to '%s_name' % (type) unless type is service, then
+     it is mapped to 'host_name'
+     keys is used for finer queries, like getting service_description=Current Load
+     on host_name=localhost (keys=['Current Load'])"""
+    funcname()
+    if not os.path.exists(options.object):
+        if options.verbose:
+            sys.stderr.write("No object.cache file, returning None\n")
+        return None
+    last_mod = os.stat(options.object)[8]
+    if not object.has_key('last_refresh') or \
+            ((object['last_refresh'] + options.min_refresh) < last_mod and refresh):
+        process_object(options.object)
+    funcname(False)
+    if object.has_key(type):
+        if type_name is not None:
+            if object[type].has_key(type_name):
+                if len(keys):
+                    object_dict = {}
+                    for key in keys:
+                        if not object[type][type_name].has_key(key):
+                            break
+                        object_dict[key] = object[type][type_name][key]
+                    return object_dict
+                else:
+                    if type == 'service':
+                        return object[type][type_name].keys()
+                    else:
+                        return object[type][type_name]
+        else:
+            return object[type].keys()
+    return None
+
+def process_object(file):
+    """Read object file, sanitize and store in global variable."""
+    funcname()
+    print "[%.2f] Refreshing Objects." % (time.time())
+    object = {}
+    object_index = {}
+    try:
+        object_lines = open(file).readlines()
+    except:
+        if options.verbose:
+            sys.stderr.write("Tried to open cache file, but failed.\n")
+    else:
+        tag = ''
+        for line in object_lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                if options.verbose:
+                    sys.stderr.write("Read comment from object file.\n")
+                continue
+            if line.startswith('define'):
+                temp = {}
+                old_tag = tag
+                tag = line.split()[1]
+                if tag.endswith('status'):
+                    tag = tag.split('status')[0]
+                if options.verbose:
+                    if tag != old_tag:
+                        if old_tag:
+                            sys.stderr.write("Finished %s '%s' items\n" % (tag_count, old_tag))
+                        sys.stderr.write("Beginning define block for '%s'\n" % (tag))
+                        tag_count = 1
+                    else:
+                        tag_count += 1
+                if not object.has_key(tag):
+                    object[tag] = {}
+                    object_index[tag] = set()
+                continue
+            if line.endswith('}'):
+                if line != '}':
+                    (entry, value) = line.split('\t', 1)
+                    try:
+                        value = float(value)
+                    except:
+                        value = value.strip()
+                    temp[entry] = value
+                # base catchall - hosts, hostgroups, contacts, contactgroups
+                if temp.has_key('%s_name' % (tag)):
+                    tag_name = temp.pop('%s_name' % (tag))
+                    object[tag][tag_name] = temp
+                    object_index[tag].add(tag_name)
+                # host escalations
+                elif temp.has_key('host_name') and not temp.has_key('service_description'):
+                    host_name = temp.pop('host_name')
+                    if not object[tag].has_key(host_name):
+                        object[tag][host_name] = {}
+                    object[tag][host_name] = temp
+                    object_index[tag].add(host_name)
+                # services and service escalations
+                elif temp.has_key('service_description'):
+                    if not temp.has_key('host_name'):
+                        temp['host_name'] = None
+                    host_name = temp.pop('host_name')
+                    service = temp.pop('service_description')
+                    if not object[tag].has_key(host_name):
+                        object[tag][host_name] = {}
+                    object[tag][host_name][service] = \
+                            temp
+                    object_index[tag].add(service)
+                else:
+                    print "missed tag %s" % (tag)
+                    pprint.pprint(temp)
+            elif line:
+                (entry, value) = line.split('\t', 1)
+                try:
+                    value = float(value)
+                except:
+                    value = value.strip()
+                temp[entry] = value
+    object['last_refresh'] = int(time.time())
+    # sets aren't serializeable
+    for key in object_index:
+        object_index[key] = list(object_index[key])
+    funcname(False)
+    return object, object_index
+
+def return_status(type, refresh=True, type_name=None, keys=''):
+    """returns dict object of matched nagios status.
+     type is the type of status to query.  contact, service, host, etc
+     refresh:  If true, reload the cache if it's newer than current.
+     type_name is mapped to '%s_name' % (type) unless type is service, then
+     it is mapped to 'host_name'
+     keys is used for finer queries, like getting service_description=Current Load
+     on host_name=localhost (keys=['Current Load'])"""
+    funcname()
+    if not os.path.exists(options.status):
+        if options.verbose:
+            sys.stderr.write("No status file, returning None\n")
+        cleanquit(0, 'No status file.')
+    last_mod = os.stat(options.status)[8]
+    if not status.has_key('last_refresh') or \
+            ((status['last_refresh'] + options.min_refresh) < last_mod and refresh):
+        process_status(options.status)
+    funcname(False)
+    if status.has_key(type):
+        if type_name is not None:
+            if status[type].has_key(type_name):
+                if len(keys):
+                    status_dict = {}
+                    for key in keys:
+                        if not status[type][type_name].has_key(key):
+                            break
+                        status_dict[key] = status[type][type_name][key]
+                    return status_dict
+                else:
+                    if type == 'service':
+                        return status[type][type_name].keys()
+                    else:
+                        return status[type][type_name]
+        else:
+            return status[type].keys()
+    return None
+
+def cmp_service_last_state_change(x, y):
+    """Compare services by last state change.  For sorting.
+    Expects two, two-item tuples of ('host_name', 'service')
+    Directly reads status dictionary for speed."""
+    funcname()
+    x_lsc = status['service'][x[0]][x[1]]['last_state_change']
+    y_lsc = status['service'][y[0]][y[1]]['last_state_change']
+    return_val = cmp(x_lsc,y_lsc)
+    funcname(False)
+    return return_val
+
+def process_status(file):
+    """Read status file, sanitize and store in global variable."""
+    print "[%.2f] Refreshing Status." % (time.time())
+    funcname()
+    status = {}
+    status_index = {}
+    try:
+        status_lines = open(file).readlines()
+    except:
+        if options.verbose:
+            sys.stderr.write("Tried to open status file, but failed.\n")
+    else:
+        tag = ''
+        for line in status_lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                if options.verbose:
+                    sys.stderr.write("Read comment from status file.\n")
+                continue
+            if line.endswith('{'):
+                temp = {}
+                old_tag = tag
+                tag = line.split()[0]
+                tag = tag.strip()
+                if tag.endswith('status'):
+                    tag = tag.split('status')[0]
+                    shorttag = tag
+                elif tag.endswith('downtime'):
+                    shorttag = tag.split('downtime')[0]
+                elif tag.endswith('comment'):
+                    shorttag = tag.split('comment')[0]
+                else:
+                    shorttag = tag
+                if options.verbose:
+                    if tag != old_tag:
+                        if old_tag:
+                            sys.stderr.write("Finished %s '%s' items\n" % (tag_count, old_tag))
+                        sys.stderr.write("Beginning block for '%s'\n" % (tag))
+                        tag_count = 1
+                    else:
+                        tag_count += 1
+                if not status.has_key(tag):
+                    status[tag] = {}
+                if not status_index.has_key(tag):
+                    status_index[tag] = {}
+                continue
+            if line.endswith('}') and not line.startswith('plugin_output') and \
+                    not line.startswith('long_plugin_output'):
+                if line != '}':
+                    (entry, value) = line.split('=', 1)
+                    try:
+                        value = float(value)
+                    except:
+                        value = value
+                    temp[entry] = value
+                #if temp.has_key('current_status') and temp['current_status'] == 0:
+                #    continue
+                if tag.startswith('service'):
+                    if not temp.has_key('host_name'):
+                        temp['host_name'] = None
+                    host_name = temp.pop('host_name')
+                    if not status[tag].has_key(host_name):
+                        status[tag][host_name] = {}
+                    try:
+                        # This can give a key error, but I don't know why!
+                        service_description = temp.pop('service_description')
+                    except:
+                        if options.verify:
+                            print "[%.2f] Intercepted KeyError for popping!" % (time.time())
+                            keys=temp.keys()
+                            keys.sort()
+                            if options.verbose:
+                                print keys
+                                pprint.pprint(temp)
+                            os.kill(os.getpid(), 9)
+                    else:
+                        status[tag][host_name][service_description] = \
+                                temp
+                        # initialize all the indexes, populate!
+                        for index in ['current_state', 'last_check', 'last_state_change', \
+                                'problem_has_been_acknowledged', 'scheduled_downtime_depth']:
+                            if temp.has_key(index):
+                                if not status_index[tag].has_key(index):
+                                    status_index[tag][index] = {}
+                                if not status_index[tag][index].has_key(temp[index]):
+                                    status_index[tag][index][temp[index]] = \
+                                        [(host_name, service_description)]
+                                else:
+                                    status_index[tag][index][temp[index]]\
+                                            .append((host_name, service_description))
+                elif temp.has_key('%s_name' % (shorttag)):
+                    tag_name = temp.pop('%s_name' % (shorttag))
+                    if 'comment' in tag or 'downtime' in tag:
+                        if tag_name not in status[tag]:
+                            status[tag][tag_name] = []
+                        print "Appending to %s\n>> %s" % (tag_name, temp)
+                        status[tag][tag_name].append(temp)
+                    status[tag][tag_name] = temp
+                    # initialize all the indexes, populate!
+                    for index in ['current_state', 'last_check', 'last_state_change',
+                            'problem_has_been_acknowledged', 'scheduled_downtime_depth']:
+                        if temp.has_key(index):
+                            if not status_index[tag].has_key(index):
+                                status_index[tag][index] = {}
+                            if not status_index[tag][index].has_key(temp[index]):
+                                status_index[tag][index][temp[index]] = \
+                                    [tag_name]
+                            else:
+                                status_index[tag][index][temp[index]].append(tag_name)
+                else:
+                    status[tag] = temp
+            elif line:
+                (entry, value) = line.split('=', 1)
+                try:
+                    value = float(value)
+                except:
+                    value = value
+                temp[entry] = value
+    status['last_refresh'] = int(time.time())
+    funcname(False)
+    return status, status_index
+
+def get_jira(host, service, lastchange):
+    """Take a hostname and a service, and return the most recent open or new
+    JIRA ticket"""
+    funcname()
+    global tickets
+    jira = '/usr/local/nagios/bin/jira'
+    ticket, owner, priority = None, None, None
+    ticketcmd = []
+
+    splay = random.randint(0,3600)
+    # fail silently
+    if os.path.isfile(jira):
+        if not tickets.has_key(host):
+            tickets[host] = {}
+        # We have a ticket and (service state is old OR ticket data isn't stale)
+        # then read from the cache
+        if tickets[host].has_key(service) and tickets[host][service].has_key('time') and \
+                time.time() < tickets[host][service]['time']:
+            if tickets[host][service]['owner'] is not None:
+                print "[%.2f] Got ticket from cache for %s/%s (expires in %is)" % \
+                        (time.time(), host, service, (tickets[host][service]['time'] - time.time()))
+            owner    = tickets[host][service]['owner']
+            ticket   = tickets[host][service]['ticket']
+            priority = tickets[host][service]['priority']
+        else:
+            if service is None:
+                cmd = '%s getissues "Summary ~ \'%%%s is\' and Resolution=Unresolved"' % \
+                        (jira, host)
+            else:
+                cmd = '%s getissues "Summary ~ \'%%%s/%s is\' and Resolution=Unresolved"' % \
+                        (jira, host, service.replace(' ', '%'))
+            sin, sout, serr = os.popen3(cmd)
+            ticketcmd = sout.readlines()
+            # got full meta data from ticket query.
+            if len(ticketcmd) and len(ticketcmd[-1].split(',')):
+                print "[%.2f] Got ticket from JIRA for %s/%s (caching for %is)" % \
+                        (time.time(), host, service, 7200 + splay)
+                ticket   = ticketcmd[-1].split(',')[0]
+                cmd = '%s cat %s' % (jira, ticket)
+                sin, sout, serr = os.popen3(cmd)
+                fieldscmd = sout.readlines()
+                for line in fieldscmd:
+                    line = line.split(':', 1)
+                    if line[0] == 'Assignee':
+                        owner = line[1].strip()
+                    elif line[0] == 'Priority':
+                        priority = line[1].strip()
+            else:
+                print "[%.2f] Got NO ticket from JIRA for %s/%s (caching for %is)" % \
+                        (time.time(), host, service, 7200 + splay)
+            if not tickets[host].has_key(service):
+                tickets[host][service] = {}
+            tickets[host][service] = {'owner': owner, 'ticket': ticket,
+                                      'priority': priority, 'time': int(time.time() + 7200 + splay)}
+                
+    funcname(False)
+    return ticket, owner, priority
+
+def get_ticket(host, service, lastchange):
+    """Take a hostname and a service, and return the most recent open or new
+    ticket"""
+    funcname()
+    global tickets
+    rt = '/usr/local/bin/rt'
+    ticket, owner, priority = None, None, None
+    ticketcmd = []
+    if os.path.isfile(rt):
+        if not tickets.has_key(host):
+            tickets[host] = {}
+        # We have a ticket and (service state is old OR ticket data isn't stale)
+        # then read from the cache
+        if tickets[host].has_key(service) and tickets[host][service].has_key(time) and \
+                (lastchange > tickets[host][service]['time'] or
+                (time.time() - 600) > tickets[host][service]['time']):
+            if tickets[host][service]['owner'] is not None:
+                print "[%.2f] Got ticket from cache for %s/%s." % (time.time(), host, service)
+            owner    = tickets[host][service]['owner']
+            ticket   = tickets[host][service]['ticket']
+            priority = tickets[host][service]['priority']
+        else:
+            cmd = '%s ls -f id,owner,priority "Subject like \'%%%s%%%s%%\' and '
+            cmd += ' ( Status = \'New\' or Status = \'Open\' )"'
+            cmd = cmd % (rt, host, service)
+            sin, sout, serr = os.popen3(cmd)
+            ticketcmd = sout.readlines()
+            # got full meta data from ticket query.
+            if len(ticketcmd) and len(ticketcmd[-1].split('\t')) == 3:
+                print "[%.2f] Got ticket from RT for %s/%s." % (time.time(), host, service)
+                ticket   = ticketcmd[-1].split('\t')[0].strip()
+                owner    = ticketcmd[-1].split('\t')[1].strip()
+                priority = ticketcmd[-1].split('\t')[2].strip()
+            else:
+                print "[%.2f] Got NO ticket from RT for %s/%s." % (time.time(), host, service)
+            if not tickets[host].has_key(service):
+                tickets[host][service] = {}
+            tickets[host][service] = {'time': time.time(),
+                    'ticket': ticket, 'owner': owner, 'priority': priority}
+                
+    funcname(False)
+    return ticket, owner, priority
+
+def process_report():
+    """Inspect object and status dictionaries, and build report-specific
+    payloads"""
+    funcname()
+    global status
+    global status_index
+    global object
+    global object_index
+    global report
+
+    # Don't query for tickets the first time through.
+    if report == {}:
+        first = True
+    else:
+        first = False
+
+
+    print "[%.2f] Refreshing Reports." % (time.time())
+
+    _report = {'hostgroup_svc': {},
+                'hostgroup_svc_prob': {},
+                'hostgroup_svc_count': {}}
+    for hostgroup in object['hostgroup']:
+        _report['hostgroup_svc'][hostgroup] = {'members':[], \
+                'current_state': {0:{}, 1:{}, 2:{}, 3:{}}}
+        _report['hostgroup_svc_prob'][hostgroup] = {'current_state': {1:{}, 2:{}, 3:{}}} 
+        _report['hostgroup_svc_count'][hostgroup] = {\
+                'current_state': {0:0, 1:0, 2:0, 3:0},
+                'unhandled': {1:0, 2:0, 3:0},
+                'duration': {1:[], 2:[], 3:[]}}
+        for host in object['hostgroup'][hostgroup]['members'].split(','):
+            _report['hostgroup_svc'][hostgroup]['members'].append(host)
+            try:
+                service_host_keys = status['service'][host].keys()
+            except:
+                # no keys for host?
+                print "No keys for host %s in status['service']" % (host)
+                continue
+            for service in status['service'][host].keys():
+                current_state = status['service'][host][service]['current_state']
+                if status['service'][host][service]['state_type'] == 1:
+                    duration = (time.time() - \
+                            status['service'][host][service]['last_hard_state_change'])
+                else:
+                    duration = (time.time() - \
+                            status['service'][host][service]['last_state_change'])
+                if (current_state == 2) and not first:
+                    ticket, owner, priority = get_jira(host, service,\
+                            status['service'][host][service]['last_hard_state_change'])
+                else:
+                    ticket, owner, priority = None, None, None
+                _report['hostgroup_svc'][hostgroup]['current_state']\
+                        [current_state][duration] = {'host':host, 'service':service, \
+                                'ack': status['service'][host][service]\
+                                        ['problem_has_been_acknowledged'], \
+                                'downtime': status['service'][host][service]\
+                                        ['scheduled_downtime_depth'], \
+                                'output': status['service'][host][service]['plugin_output'], \
+                                'duration': duration,
+                                'hard': status['service'][host][service]\
+                                        ['state_type'], \
+                                'ticket': ticket, 'owner': owner, 'priority': priority}
+                # hostgroup_svc_count report
+                _report['hostgroup_svc_count'][hostgroup]['current_state']\
+                        [current_state] += 1
+                if current_state > 0:
+                    _report['hostgroup_svc_prob'][hostgroup]['current_state']\
+                            [current_state][duration] = {'host':host, 'service':service, \
+                                    'ack': status['service'][host][service]\
+                                            ['problem_has_been_acknowledged'], \
+                                    'downtime': status['service'][host][service]\
+                                            ['scheduled_downtime_depth'], \
+                                    'output': status['service'][host][service]['plugin_output'], \
+                                    'duration': duration,
+                                    'ticket': ticket, 'owner': owner, 'priority': priority}
+                    _report['hostgroup_svc_count'][hostgroup]['duration']\
+                            [current_state].append(duration)
+                    if (status['service'][host][service]['problem_has_been_acknowledged'] + \
+                            status['service'][host][service]['scheduled_downtime_depth']) < 1:
+                        # unhandled alert.
+                        _report['hostgroup_svc_count'][hostgroup]['unhandled'][current_state] += 1
+            
+
+    print "[%.2f] Done refreshing Reports." % (time.time())
+    funcname(False)
+    return _report
+
+class ResponseHandler(SocketServer.BaseRequestHandler):
+    """
+    Recieves and handles a client request.
+    """
+
+    def handle(self):
+        global status, object, status_index, object_index, report, tickets
+        top_level = {'status': status, 'object': object, 
+                'status_index': status_index, 'object_index': object_index,
+                'report': report, 'tickets': tickets}
+        while True:
+            try:
+                self.data = self.request.recv(1024).strip()
+            except:
+                # conection closed!
+                break
+            else:
+                self.data = self.data.replace('\\ ', '__space__')
+                query_words = self.data.split(' ')
+                x = 0
+                for word in query_words:
+                    if '__space__' in word:
+                        query_words[x] = word.replace('__space__', ' ')
+                    x += 1
+                print "[%.2f] query: %s" % (time.time(), query_words)
+                result = {'query_ok': False}
+                error = False
+                subset = top_level
+                for word in query_words:
+                    try:
+                        word = float(word)
+                    except:
+                        pass
+                    if word in subset:
+                        subset = subset[word]
+                    else:
+                        result.update({'status': 'error at %s, keys: %s' % (word, subset.keys())})
+                        error = True
+                        break
+
+                if not error:
+                    result['query_ok'] = True
+                    try:
+                        result.update(subset)
+                    except:
+                        result[word] = subset
+                package = simplejson.dumps(result)
+                self.request.send("%024i" % (len(package)))
+                print "[%.2f] Sending %s byte package." % (time.time(), len(package))
+                self.request.send(package)
+                # kill thread
+                self.request.close()
+                print "[%.2f] Sent, keys: %s" % (time.time(), result.keys()[:24])
+
+class StatusRefresher(threading.Thread):
+    """
+    Status and Object Refresher thread
+    """
+    def __init__(self):
+        threading.Thread.__init__(self)
+        self._finished = threading.Event()
+
+    def shutdown(self):
+        """Stop this thread"""
+        self._finished.set()
+
+    def run(self):
+        global status
+        global status_index
+        global status_lock
+        global object
+        global object_index
+        global object_lock
+        global report
+        global report_lock
+        exit = False
+        while not exit:
+            refreshed = False
+            try:
+                last_mod = os.stat(options.object)[8]
+            except:
+                # object file missing, probably during a restart?
+                last_mod = 0
+            if not object.has_key('last_refresh') or \
+                    (object['last_refresh'] < last_mod):
+                object, object_index = process_object(options.object)
+                refreshed = True
+            try:
+                last_mod = os.stat(options.status)[8]
+            except:
+                # status file missing, probably during a restart
+                last_mod = 0
+            if not status.has_key('last_refresh') or \
+                    ((status['last_refresh'] + options.min_refresh) < last_mod):
+                status, status_index = process_status(options.status)
+                refreshed = True
+            if refreshed:
+                
+                _report = process_report()
+                report = _report
+            slept = 1
+            while slept < options.min_refresh:
+                time.sleep(1)
+                slept += 1
+                if self._finished.isSet():
+                    exit = True
+                    break
+            
+class StatsSocket(threading.Thread):
+    """
+    Socket Server thead
+    """
+    def __init__(self):
+        threading.Thread.__init__(self)
+
+    def run(self):
+        try:
+            server.serve_forever()
+        except socket.error:
+            print "TCP bind error, exiting!"
+            os.kill(os.getpid(), 9)
+
+
+if __name__ == '__main__':
+    options = init()
+    # Fork riiight around here
+    #
+    # get local ip address
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(('google.com', 80))
+    HOST = s.getsockname()[0]
+    s.close()
+    #HOST = "204.15.80.150"
+    if not options.verify:
+        try:
+            server = SocketServer.TCPServer((HOST, int(options.Port)), ResponseHandler)
+        except socket.error:
+            print "TCP bind error, exiting!"
+            sys.exit(2)
+    _SR = StatusRefresher()
+    _SR.start()
+    if not options.verify:
+        _SS = StatsSocket()
+    while 'last_refresh' not in status and 'last_refresh' not in object:
+        time.sleep(1)
+    if not options.verify:
+        print "Starting socket listener on %s." % (HOST)
+        _SS.start()
+    else:
+        while report == {}:
+            time.sleep(1)
+        print "Verification complete!"
+        sys.exit(0)
+
+    try:
+        while True:
+            if not _SR.isAlive():
+                print "[%.2f] StatusRefresher thread died, restarting." % (time.time())
+                _SR.start()
+            if not options.verify and not _SS.isAlive():
+                print "[%.2f] StatsSocket thread died, restarting." % (time.time())
+                _SS.start()
+            time.sleep(60)
+    except KeyboardInterrupt:
+        os.kill(os.getpid(), 9)
+
+

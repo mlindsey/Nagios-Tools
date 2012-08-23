@@ -1,3 +1,46 @@
 Checkscripts, event handlers, notification handlers, patches, etc.
 
-3.2+
+# cache
+Only run a script if a file cache is stale.
+
+# precache
+Run a script via `at` if a file cache is stale, always provide data from
+cache.
+Useful for doing high impact queries asynchronously.
+
+# event_handler.py
+Global event handler wrapper.
+
+# nagios_command.py
+Quick method to get full nagios command line.  Depends on nagiosstatd
+
+# nagios_escalation.py
+Quick method to get nagios escalation list.
+
+# nagiosstatc
+Script to query stats daemon for json dump.
+
+# nagiosstatd
+Keeps a running copy of object and status data, as well as optional jira
+ticket tracking.  Runs on tcp port 8667, supplies data via JSON queries.
+Provides functionality similar to MkLiveStatus without the impact of
+running an event broker.
+
+# nagsub.py
+Example script to submit notifications and events to a tracking database.
+
+# notification_feeder.py
+Asynchronous notification feeder.  Dump non-paging messages into a ramdisk
+spool to be handled by the notification server.
+
+# notification_server.py
+Multi-threaded notification server with json-style templating system and
+cachable meta-data.
+
+# send_nsca_cached
+Updated version of OpView script to provide a caching layer around NSCA
+submissions.
+
+# nagios_to_cacti
+Incomplete proof of concept for high performance conduit to submit Nagios
+performance data to a Boost-enabled Cacti instance.

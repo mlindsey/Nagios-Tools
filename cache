@@ -1,0 +1,47 @@
+#!/usr/local/bin/bash
+
+# $1 = cache time
+# $2 = script
+# ++ = args
+
+PATH=/bin:/usr/bin:/usr/local/bin
+
+time=$1
+iam=`whoami`
+script=$2
+args=`echo $@ | cut -f3-99 -d\ `
+
+echo "$1 $2 $ARGS" >> /tmp/cache
+
+if [ ! -d /tmp/cache-${iam}/ ]
+then
+    mkdir /tmp/cache-${iam}
+fi
+
+cf="/tmp/cache-${iam}/`echo ${script} ${args} | sed -e 's/\//_/g' | tr \  _`"
+
+if [ ! -f ${cf} ]
+then
+    runit=1
+else
+    st_mtime=`stat -c %Y ${cf}`
+    t=`echo $st_mtime + $time | bc`
+    if [ "${t}" -gt "`date +%s`" ]
+    then
+        runit=0
+    else
+        runit=1
+    fi
+
+fi
+
+if [ $runit == 1 ]
+then
+    out=`${script} ${args}`
+    printf "%b" "${out}" > ${cf}
+    printf "%b" "${out}"
+else
+    cat ${cf}
+fi
+
+

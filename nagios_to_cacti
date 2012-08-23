@@ -1,0 +1,580 @@
+#!/usr/bin/python -u
+# -*- coding: ascii -*-
+'''Nagios performance parsing daemon, with fully automated Cacti (Boost) submission.'''
+
+import sys
+import os
+import MySQLdb
+from time import time
+from hashlib import md5
+from pprint import pprint
+from optparse import OptionParser
+
+status = {}
+
+# track function depth
+depth = 0
+
+states = {'host': { 0: 'UP',
+                    1: 'DOWN',
+                    2: 'UNREACHABLE',
+                    'UP': 0,
+                    'DOWN': 1,
+                    'UNREACHABLE': 2},
+        'service': { 0: 'OK',
+                     1: 'WARNING',
+                     2: 'CRITICAL',
+                     3: 'UNKNOWN',
+                    'OK': 0,
+                    'WARNING': 1,
+                    'CRITICAL': 2,
+                    'UNKNOWN': 3} }
+
+labels = {'s': 'seconds', 'ms': 'milliseconds', 'B': 'bytes', 'b': 'bits',
+        'KB': 'kilobytes', 'MB': 'megabytes', '%': 'percent'}
+# Color hash
+color = {}
+
+def init():
+    global options
+    '''collect option information, display help text if needed, set up debugging'''
+    parser = OptionParser()
+    default = {}
+    help = {}
+    help_strings = ['status','cacti', 'user', 'passwd', 'db', 'Snmp']
+    #help_integer = []
+    default['status'] = '/usr/local/nagios/var/status.dat'
+    default['cacti'] = 'localhost'
+    default['user'] = 'cactiuser'
+    default['passwd'] = 'cacti'
+    default['db'] = 'cacti'
+    default['Snmp'] = 'public'
+    help['status'] = 'Full path to Nagios status file - ramdisk for best results.\n'
+    help['status'] += 'Default = %s' % (default['status'])
+    help['cacti'] = 'Cacti Database Hostname - Boost must be enabled!'
+    help['user'] = 'Cacti Database Username'
+    help['passwd'] = 'Cacti Database Username'
+    help['db'] = 'Cacti Database name'
+    help['Snmp'] = 'SNMP Community'
+    
+    for str in help_strings:
+        parser.add_option("-%s" % (str[0]), "--%s" % (str), type="string", dest=str,
+                                default=default[str], help=help[str])
+    parser.add_option("-V", "--verify", action="store_true", dest="verify",
+                            default=False,
+                            help="Don't create cacti templates, just verify.")
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose",
+                            default=False,
+                            help="print debug messages to stderr")
+    (options, args) = parser.parse_args()
+    if options.verbose:
+        sys.stderr.write(">>DEBUG sys.argv[0] running in " +
+                                "debug mode\n")
+    error = False
+    if not os.path.exists(options.status):
+        error = True
+        print "Nagios Status file does not exist at '%s'" % (options.status)
+    if error:
+        parser.print_help()
+        sys.exit(0)
+    return options
+
+
+def return_status(type, refresh=True, type_name=None, keys=''):
+    '''returns dict object of matched nagios status.
+     type is the type of status to query.  contact, service, host, etc
+     refresh:  If true, reload the cache if it's newer than current.
+     type_name is mapped to '%s_name' % (type) unless type is service, then
+     it is mapped to 'host_name'
+     keys is used for finer queries, like getting service_description=Current Load
+     on host_name=localhost (keys=['Current Load'])'''
+    if not os.path.exists(options.status):
+        if options.verbose:
+            sys.stderr.write("No status file, returning None\n")
+        cleanquit(0, 'No status file.')
+    last_mod = os.stat(options.status)[8]
+    if not status.has_key('last_refresh') or \
+            ((status['last_refresh'] + options.max_refresh) < last_mod and refresh):
+        process_status(options.status)
+    if status.has_key(type):
+        if type_name is not None:
+            if status[type].has_key(type_name):
+                if len(keys):
+                    status_dict = {}
+                    for key in keys:
+                        if not status[type][type_name].has_key(key):
+                            break
+                        status_dict[key] = status[type][type_name][key]
+                    return status_dict
+                else:
+                    if type == 'service':
+                        return status[type][type_name].keys()
+                    else:
+                        return status[type][type_name]
+        else:
+            return status[type].keys()
+    return None
+
+def process_status(file):
+    '''Read status file, sanitize and return'''
+    print "[%.2f] Refreshing Status." % (time())
+    status = {}
+    try:
+        status_lines = open(file).readlines()
+    except:
+        if options.verbose:
+            sys.stderr.write("Tried to open status file, but failed.\n")
+    else:
+        tag = ''
+        for line in status_lines:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                if options.verbose:
+                    pass
+                    #sys.stderr.write("Read comment from status file.\n")
+                continue
+            if line.endswith('{'):
+                temp = {}
+                old_tag = tag
+                tag = line.split()[0]
+                tag = tag.strip()
+                if tag.endswith('status'):
+                    tag = tag.split('status')[0]
+                    shorttag = tag
+                elif tag.endswith('downtime'):
+                    shorttag = tag.split('downtime')[0]
+                elif tag.endswith('comment'):
+                    shorttag = tag.split('comment')[0]
+                else:
+                    shorttag = tag
+                if options.verbose and 'comment' not in tag and 'downtime' not in tag:
+                    if tag != old_tag:
+                        if old_tag:
+                            sys.stderr.write("Finished %s '%s' items\n" % (tag_count, old_tag))
+                        sys.stderr.write("Beginning block for '%s'\n" % (tag))
+                        tag_count = 1
+                    else:
+                        tag_count += 1
+                if not status.has_key(tag):
+                    status[tag] = {}
+            elif line.endswith('}') and not line.startswith('plugin_output') and \
+                    not line.startswith('long_plugin_output'):
+                if line != '}':
+                    (entry, value) = line.split('=', 1)
+                    try:
+                        value = float(value)
+                    except:
+                        value = value
+                    temp[entry] = value
+                #if temp.has_key('current_status') and temp['current_status'] == 0:
+                #    continue
+                if tag.startswith('service'):
+                    if not temp.has_key('host_name'):
+                        temp['host_name'] = None
+                    host_name = temp.pop('host_name')
+                    if not status[tag].has_key(host_name):
+                        status[tag][host_name] = {}
+                    try:
+                        # This can give a key error, but I don't know why!
+                        service_description = temp.pop('service_description')
+                    except:
+                        if options.verify:
+                            print "[%.2f] Intercepted KeyError for popping!" % (time())
+                            keys=temp.keys()
+                            keys.sort()
+                            if options.verbose:
+                                print keys
+                                pprint(temp)
+                            os.kill(os.getpid(), 9)
+                    else:
+                        status[tag][host_name][service_description] = \
+                                temp
+                elif temp.has_key('%s_name' % (shorttag)):
+                    tag_name = temp.pop('%s_name' % (shorttag))
+                    status[tag][tag_name] = temp
+                else:
+                    status[tag] = temp
+            elif line:
+                try:
+                    (entry, value) = line.split('=', 1)
+                except:
+                    print line
+                    raise
+                try:
+                    value = float(value)
+                except:
+                    value = value
+                temp[entry] = value
+    status['last_refresh'] = time()         
+    return status
+
+def generate_hash(seed):
+    return md5('%s%0.8f' % (seed, time())).hexdigest()
+
+def init_cdb():
+    conn = MySQLdb.connect (host = options.cacti,
+                            user = options.user,
+                            passwd = options.passwd,
+                            db = options.db)
+    return conn
+
+
+
+def do_sql(sql):
+    cursor = conn.cursor()
+    if options.verbose: print "SQL: %s" % (sql)
+    try:
+        cursor.execute(sql)
+    except:
+        print "Error executing SQL '%s'" % (sql)
+        raise
+    results = cursor.fetchall()
+    conn.commit()
+    if not len(results):
+        return None
+    elif len(results) == 1:
+        if options.verbose: print "RET: %s" % (results[0][0])
+        return results[0][0]
+    else:
+        if options.verbose: print "RET: %s" % (results[0])
+        return results[0]
+
+def get__snmp_community(name=None):
+    if not name:
+        sql = 'SELECT value FROM settings WHERE name=\'snmp_community\''
+    else:
+        sql = 'SELECT snmp_community FROM %s WHERE %sname=\'%s\'' % (tname, tname, name)
+    snmp_community = do_sql(sql)
+    return snmp_community
+
+def get__hosttemplate(name):
+    '''Get hosttemplate id'''
+    return do_sql('SELECT id FROM %s_template WHERE name="%s"' % (tname, name))
+
+def get__host(name):
+    '''Get id for Cacti Host.  Return None if not present.'''
+    return do_sql('SELECT id FROM %s WHERE %sname="%s"' % (tname, tname, name))
+
+def get__data_template(name):
+    '''Get id for data template.  Return None if not present.'''
+    return do_sql('SELECT id FROM data_template WHERE name="%s"' % (name))
+
+def get__graph_templates(name):
+    '''Get id for graph template.  Return None if not present.'''
+    return do_sql('SELECT id FROM graph_templates WHERE name="%s"' % (name))
+
+def add__hosttemplate(name):
+    '''Create host template'''
+    do_sql('INSERT INTO %s_template (hash, name) VALUES (\'%s\', \'%s\')' % (tname, generate_hash(name), name))
+    conn.commit()
+    return get__hosttemplate(name)
+
+def add__host(name, tid):
+    '''Create Cacti Host, return host id.'''
+    do_sql('''INSERT INTO %s (%s_template_id, description, %sname, snmp_community, snmp_version)
+VALUES (%i, '%s', '%s', '%s', 2)''' % (tname, tname, tname, tid, name, name, options.Snmp))
+    conn.commit()
+    return get__host(name)
+
+def add__data_template_data_rra(id, rra):
+    '''Add data_template_data_rra entries (data storage duration)'''
+    do_sql('INSERT INTO data_template_data_rra (data_template_data_id, rra_id) VALUES (%s, %s)' % (id, rra))
+    conn.commit()
+
+def add__data_template(dim_id, name, label):
+    '''Create Data Template'''
+    # Create Data Template
+    do_sql('''INSERT INTO data_template (hash, name) VALUES ('%s', '%s')''' % (generate_hash(name), name))
+    conn.commit()
+    dt_id = get__data_template(name)
+    # Configure the data template.
+    # update later to support more variable rrd_steps and heartbeats.
+    do_sql('''INSERT INTO data_template_data (data_template_id, data_input_id, name, name_cache, active, rrd_step)
+VALUES (%i, %i, '|host_description| - %s', '', 'no', 300)''' % (dt_id, dim_id, name))
+    dtd_id = get__data_template_data(0, dt_id)
+    for rra in [1, 2, 3, 4]:                    # Do better to determine what the local install
+        add__data_template_data_rra(dtd_id, rra)    # actually shoves in its RRDs
+    
+    # and the data_template_rrd entries
+    for x in [label, label + 'warn', 'crit']:
+        add__data_template_rrd(dt_id, x)
+
+    return dt_id
+
+def add__data_local(host_id, dt_id, dim_id, host, name, label):
+    '''Add data_local entry and the corresponding data_template_data local entry.'''
+    do_sql('INSERT INTO data_local (data_template_id, host_id, snmp_index) VALUES (%i, %i, "")' % \
+            (dt_id, host_id))
+    dl_id = get__data_local(host_id, dt_id)
+
+    _name = '|host_description| - %s - %s' % (name, label)
+    name_cache = '%s - %s - %s' % (host, name, label)
+    data_source_path = '<path_rra>/%i/%i.rrd' % (host_id, dl_id)
+    do_sql('''INSERT INTO data_template_data (local_data_template_data_id, local_data_id, data_template_id,
+data_input_id, name, name_cache, data_source_path, active, rrd_step) VALUES (%i, %i, %i, %i, 
+'%s', '%s', '%s', 'no', 300)''' % (dt_id, dl_id, dt_id, dim_id, _name, name_cache, data_source_path))
+    dtd_id = get__data_template_data(dl_id, dt_id)
+    for x in [label, 'warn', 'crit']:
+        addl__data_template_rrd(dtd_id, dl_id, dt_id, x)
+        #dtr_id = get__data_template_rrd(dt_id, x)
+        #ldtr_id = getl__data_template_rrd(dtr_id, dl_id, dt_id, x)
+        #print ldtr_id, dl_id, dt_id, x
+
+    return dl_id
+
+def add__graph_templates(name, label):
+    '''Create Graph Template'''
+    do_sql('''INSERT INTO graph_templates (hash, name) VALUES ('%s', '%s')''' % (generate_hash(name), name))
+    conn.commit()
+    id = get__graph_templates(name)
+    # Configure the graph template.
+    do_sql('''INSERT INTO graph_templates_graph (graph_template_id, image_format_id, t_title, title,
+height, width, upper_limit, vertical_label, auto_scale, auto_scale_opts, auto_scale_rigid, auto_padding,
+base_value, export) VALUES (%i, 1, 'on', '|host_description| - %s', 150, 500, 100, '%s', 'on', '2',
+'', 'on', 1000, 'on')''' % (id, name, label))
+    
+    return get__graph_templates(name)
+
+def get__graph_local(host_id, gt_id):
+    '''Pass a host id and a graph template id, return the graph id or None.'''
+    return do_sql('''SELECT id FROM graph_local WHERE host_id=%i AND graph_template_id=%i''' % (host_id, gt_id))
+
+def add__graph_local(host_id, gt_id, host, name, label):
+    '''Create a graph, return the graph id.'''
+    do_sql('''INSERT INTO graph_local (host_id, graph_template_id, snmp_index) VALUES
+(%i, %i, '')''' % (host_id, gt_id))
+    conn.commit()
+    gl_id = get__graph_local(host_id, gt_id)
+    
+    _name = '|host_description| - %s - %s' % (name, label)
+    name_cache = '%s - %s - %s' % (host, name, label)
+    do_sql('''INSERT INTO graph_templates_graph (local_graph_template_graph_id, local_graph_id, graph_template_id,
+image_format_id, title, title_cache, height, width, upper_limit, vertical_label, auto_scale_opts, auto_scale_rigid,
+auto_padding, base_value, export) VALUES (%i, %i, %i, 1, '%s', '%s', 150, 500, 100, '%s', '2', 'on',
+'on', 1000, 'on')''' % (gt_id, gl_id, gt_id, _name, name_cache, label))
+
+    return gl_id
+
+def get__data_input(name):
+    '''Get data input id'''
+    return do_sql('SELECT id FROM data_input WHERE name=\'%s\'' % (name))
+
+def add__data_input(name):
+    '''Create Data Input method - A normal data input method would also need entries
+    in data_input_fields.  This is not a normal data input method, as this script
+    automatically submits to the boost output tables - skipping the Cacti poller entirely.'''
+    do_sql('''INSERT INTO data_input (hash, name, type_id) VALUES ('%s', '%s', 1)''' % \
+            (generate_hash(name), name))
+    conn.commit()
+    return get__data_input(name)
+
+def add__data_template_rrd(dtid, name):
+    '''Create a data_template_rrd entry.'''
+    name = gen_rrd_name(name)
+    do_sql('''INSERT INTO data_template_rrd (hash, data_template_id, rrd_heartbeat, data_source_name) VALUES
+    ('%s', %i, 600, '%s')''' % (generate_hash(name), dtid, name))
+    conn.commit()
+    
+def get__data_template_rrd(dtid, name):
+    '''Get a base data_template_rrd entry.'''
+    name = gen_rrd_name(name)
+    return do_sql('''SELECT id FROM data_template_rrd WHERE local_data_id=0 AND data_template_id=%i AND
+    data_source_name="%s"''' % (dtid, name))
+
+def addl__data_template_rrd(dtrid, ldid, dtid, name):
+    '''Create a local data_template_rrd entry.'''
+    name = gen_rrd_name(name)
+    print dtrid, ldid, dtid, name
+    do_sql('''INSERT INTO data_template_rrd (local_data_template_rrd_id, local_data_id, data_template_id,
+    rrd_heartbeat, data_source_name) VALUES
+    (%i, %i, %i, 600, '%s')''' % (dtrid, ldid, dtid, name))
+    conn.commit()
+    
+def getl__data_template_rrd(dtrid, ldid, dtid, name):
+    '''Get a base data_template_rrd entry.'''
+    name = gen_rrd_name(name)
+    print dtrid, ldid, dtid, name
+    return do_sql('''SELECT id FROM data_template_rrd WHERE local_data_template_rrd_id=%i AND local_data_id=%i
+    AND data_template_id=%i AND data_source_name="%s"''' % (dtrid, ldid, dtid, name))
+
+def get__data_local(host_id, dt_id):
+    '''get data_local.id'''
+    return do_sql('''SELECT id FROM data_local WHERE data_template_id=%i AND %s_id=%i''' % \
+            (dt_id, tname, host_id))
+
+def gen_rrd_name(label):
+    '''Take a label, return a max(19) char string'''
+    label = label.strip('_-. ')
+    if len(label) > 19:
+        label = label.strip('aeiouy')
+
+    return label[:19]
+
+def get__data_template_data(dl_id, dt_id):
+    '''return a data_template_data.id, when given a local_data_id'''
+    return do_sql('''SELECT id FROM data_template_data WHERE local_data_id='%i' AND
+    data_template_id=%i''' % (dl_id, dt_id))
+
+def process_data(host_id, dim_id, host, service, datum):
+    '''Take a host, a service, and a data structure, generate needed
+    data and graph entries, and dump data into boost tables.'''
+
+    print '\n------\nprocess_data(%i, %i, %s, %s, %s)\n------\n' % (host_id, dim_id, host, service, datum)
+
+    for label in sorted(datum.keys()):
+        for data in datum[label]:
+            if '_' in label:
+                # multiple data points for graph?
+                pass
+            if service is not None:
+                name = 'Nagios - %s / %s' % (service, label.split('_')[0])
+            else:
+                name = 'Nagios - %s' % (label.split('_')[0])
+            print '%s [%s]\n' % (name, host)
+            dt_id = get__data_template(name)
+            if dt_id is None:
+                # Generate data templates.
+                if not options.verify:
+                    dt_id = add__data_template(dim_id, name, label)
+                else:
+                    dt_id = 1
+            try:
+                x = '::%i..%i--%s' % (dt_id, host_id, name)
+            except:
+                print dt_id, host_id, name
+                raise
+
+            dl_id = get__data_local(host_id, dt_id)
+            if dl_id is None:
+                if not options.verify:
+                    dl_id = add__data_local(host_id, dt_id, dim_id, host, name, label)
+                else:
+                    dl_id = 1
+
+            gt_id = get__graph_templates(name)
+            if gt_id is None:
+                # Generate graph templates.
+                if not options.verify:
+                    gt_id = add__graph_templates(name, data['uom'])
+                else:
+                    gt_id = 1
+            try:
+                x = '::%i..%i--%s' % (gt_id, host_id, name)
+            except:
+                print gt_id, host_id, name
+                raise
+
+            gl_id = get__graph_local(host_id, gt_id)
+            if gl_id is None:
+                # Generate a graph entry.
+                if not options.verify:
+                    gl_id = add__graph_local(host_id, gt_id, host, name, label)
+                else:
+                    gl_id = 1
+
+            # submit data
+            rrd_name = gen_rrd_name(label)
+            if not options.verify:
+                do_sql('INSERT INTO poller_output_boost (local_data_id, rrd_name, time, output) VALUES ' + 
+                        '(%i, \'%s\', now(), \'%s\')' % (dl_id, rrd_name, data['value']))
+            else:
+                print('INSERT INTO poller_output_boost (local_data_id, rrd_name, time, output) VALUES ' +
+                                '(%i, \'%s\', now(), \'%s\')' % (dl_id, rrd_name, data['value']))
+        
+    return 1
+
+if __name__ == '__main__':
+    options = init()
+
+    # Read and process nagios status file
+    status = process_status(options.status)
+
+    conn = init_cdb()
+    try:
+        if len(do_sql('SHOW TABLES LIKE \'host\'')):
+            # cacti ver < 0.8.8
+            tname = 'host'
+        else:
+            tname = 'device'
+    except:
+        print 'Error checking Cacti version.'
+        raise
+
+    if options.Snmp == '':
+        options.Snmp = get__snmp_community()
+
+    hosttemplate_id = get__hosttemplate('Nagios Host')
+    if hosttemplate_id is None:
+        print 'First Run, generating \'Nagios Host\' Host Template..'
+        if not options.verify:
+            hosttemplate_id = add__hosttemplate('Nagios Host')
+        else:
+            hosttemplate_id = 1
+
+    dim_id = get__data_input('Nagios Host')
+    if dim_id is None:
+        print 'First Run, generating \'Nagios Host\' Data Input Method..'
+        if not options.verify:
+            dim_id = add__data_input('Nagios Host')
+        else:
+            dim_id = 0
+
+    for host in status['host'].keys():
+        host_id = get__host(host)
+        if host_id is None:
+            print 'First time seeing \'%s\'.. Adding to Cacti DB.' % (host)
+            if not options.verify:
+                host_id = add__host(host, hosttemplate_id)
+            else:
+                host_id = 1
+        datum = {}
+        print '\n======\n%s\n======\n' % (status['host'][host]['performance_data'])
+        for data in status['host'][host]['performance_data'].split():
+            name, data = data.split('=')
+            (value, warn, crit, other, other2) = data.split(';') # min, max?
+            label = value.strip('0123456789.')
+            value = value.replace(label,'')
+            if not label:
+                label = 'data' # just in case we have an empty string.
+            if labels.has_key(label):
+                label = labels[label]
+            #print host, value, label, warn, crit, other, other2
+            if not datum.has_key(name):
+                datum[name] = []
+            datum[name].append({'uom': label, 'value': value, 'warn': warn, 'crit': crit})
+            # Magic!
+        process_data(host_id, dim_id, host, status['host'][host]['check_command'], datum)
+
+
+        if host not in status['service'].keys():
+            # break out if the host has no services.
+            continue
+
+        for service in status['service'][host].keys():
+            datum = {}
+            for data in status['service'][host][service]['performance_data'].split():
+                if '=' not in data:
+                    continue
+                name, data = data.split('=')
+                try:
+                    (value, warn, crit, other) = data.split(';', 3)
+                except:
+                    print data
+                    raise
+                label = value.strip('0123456789.')
+                value = value.replace(label,'')
+                if not label:
+                    label = data
+                if labels.has_key(label):
+                    label = labels[label]
+                #print host, service, value, label, warn, crit, other
+                if not datum.has_key(name):
+                    datum[name] = []
+                datum[name].append({'uom': label, 'value': value, 'warn': warn, 'crit': crit})
+            # More Magic!
+            process_data(host_id, dim_id, host, service, datum)
+        # Do one, then break
+        #break
+

@@ -1,0 +1,61 @@
+#!/usr/local/bin/bash
+
+# $1 = script
+# ++ = args
+
+# Ensure that user is listed in at.allow and not in at.deny.
+# best also if the atrun crontab is set to a 1 minute interval.
+
+PATH=/bin:/usr/bin:/usr/local/bin
+
+iam=`whoami`
+script=$1
+if [ "$2" != "" ]
+then
+    args=`echo $@ | cut -f2-99 -d\ `
+else
+    args=''
+fi
+
+if [[ "${script}" == "" ]] || [[ ! -x "${script}" ]]
+then
+    echo "usage:"
+    echo "$0 <script> [<arguments>]"
+    echo "Please use full pathnames for <script>"
+    exit 3
+fi
+
+echo "$1 $ARGS" >> /tmp/precache-${iam}
+
+if [ ! -d /tmp/cache-${iam}/ ]
+then
+    mkdir /tmp/cache-${iam}
+fi
+
+cf="/tmp/cache-${iam}/`echo ${script} ${args} | sed -e 's/\//_/g' | tr \  _`"
+
+if [ ! -f ${cf} ]
+then
+    echo "No cache detected for ${cf}"
+else
+    cat < ${cf}
+
+fi
+
+echo "${script} ${args} > ${cf} 2>&1 ; echo $? > ${cf}.out" | at now > /dev/null 2>&1
+if [ $? != 0 ]
+then
+    echo Error running at.  Please ensure that ${iam} is in at.allow,
+    echo and not in at.deny.  This would be a good time to ensure that
+    echo the atrun frequency is set to once per minute as well.
+fi
+
+if [ -f ${cf}.out ]
+then
+    exit `cat ${cf}.out`
+else
+    echo No exit code found.
+    exit 3
+fi
+
+
