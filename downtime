@@ -1,0 +1,389 @@
+#!/usr/bin/env python
+
+# -*- coding: ascii -*-
+
+# downtime from the command line
+
+import base64
+import os
+import socket
+import sys
+import traceback
+import time
+
+from optparse import OptionParser
+
+def funcname():
+    # so we don't have to keep doing this over and over again.
+    return sys._getframe(1).f_code.co_name
+
+def init():
+    # collect option information, display help text if needed, set up debugging
+    parser = OptionParser()
+    parser.add_option("-g", "--ghs", type="string", dest="ghs",
+                            help="""hostgroup, host, servicegroup, or service. default=service""",
+                            default="service")
+    parser.add_option("-s", "--sh", type="string", dest="sh",
+                            help="host or service. default=service", default="service")
+    parser.add_option("-H", "--hname", type="string", dest="hname",
+                            help="Hostgroup, hostname, or servicegroup to ack. [required]")
+    parser.add_option("-S", "--sname", type="string", dest="sname",
+                            help="Service name.  Only needed if ghs=service and sh=service.")
+    parser.add_option("-c", "--comment", type="string",
+                            help="Ack comment in quotes. [required]")
+    parser.add_option("-u", "--username", type="string",
+                            help="Your username here. [required]")
+    parser.add_option("-B", "--begin", type="int", dest="begin", default=0,
+                            help="Time to begin, in seconds, from now. default: 0")
+    parser.add_option("-E", "--end", type="int", dest="end", default=1800,
+                            help="Duration of downtime, in seconds. default: 1800(30m)")
+    parser.add_option("-F", "--fixed", type="int", dest="fixed", default=1,
+                            help="Fixed or non-fixed downtime.  default=1")
+    parser.add_option("--remove", action="store_true", dest="remove", default=False,
+                            help="Remove from downtime.  Can fail, so please verify.")
+    parser.add_option("-C", "--cmdspool",type="string", dest="spoolfile",
+                            default='/usr/local/nagios/var/rw/nagios.cmd',  
+                            help="Location of Nagios command spool.")
+    parser.add_option("-O", "--object", type="string", dest="object",
+                            default='/usr/local/nagios/var/objects.cache',
+                            help="""Parse object cache for host/service/group validity.
+                            If blank, no validation is made.""")
+    parser.add_option("-l", "--logfile", type="string", dest="logfile",
+                            default='/usr/local/nagios/var/status.log',
+                            help="Location of nagios status logfile.")
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose", default=False,
+                            help="print debug messages to stderr")
+    (options, args) = parser.parse_args()
+    if options.verbose: sys.stderr.write(">>DEBUG sys.argv[0] running in debug mode\n")
+    if options.verbose: sys.stderr.write(">>DEBUG start - " + funcname() + "()\n")
+    if options.verbose: sys.stderr.write(">>DEBUG end   - " + funcname() + "()\n")
+    exit = 0
+    if not options.hname:
+        sys.stderr.write("No host/hostgroup name entered\n")
+        exit = 1
+    if not options.comment and not options.remove:
+        sys.stderr.write("No comment entered\n")
+        exit = 1
+    if not options.username:
+        sys.stderr.write("No username entered\n")
+        exit = 1
+    if exit == 1:
+        parser.print_help()
+        print "Valid flag combinations are:"
+        print "hostgroup/[host|service]"
+        print "    Put all hosts or services in a hostgroup into downtime."
+        print "servicegroup/[host|service]"
+        print "    Put all hosts that have a servicegroup, or all services in that servicegroup into downtime."
+        print "host/[host|service]"
+        print "    Put a host, or all services on a host into downtime."
+        print "service/service"
+        print "    Put a single service on a host into downtime. [--sname required]"
+        sys.exit(3)
+
+    if options.verbose: print "Building command definition"
+    command = "SCHEDULE_"
+
+    if options.ghs == "hostgroup":
+        command += "HOSTGROUP_"
+        if options.sh == "host":
+            command += "HOST_DOWNTIME"
+        elif options.sh == "service":
+            command += "SVC_DOWNTIME"
+        else: command = "UNKNOWN"
+        options.sname = ""
+    elif options.ghs == "host":
+        command += "HOST_"
+        if options.sh == "host":
+            command += "DOWNTIME"
+        elif options.sh == "service":
+            command += "SVC_DOWNTIME"
+        else: command = "UNKNOWN"
+        options.sname = ""
+    elif options.ghs == "servicegroup":
+        command += "SERVICEGROUP_"
+        if options.sh == "host":
+            command += "HOST_DOWNTIME"
+        elif options.sh == "service":
+            command += "SVC_DOWNTIME"
+        else: command = "UNKNOWN"
+        options.sname = ""
+    elif options.ghs == "service":
+        command += "SVC_"
+        if options.sh == "service":
+            command += "DOWNTIME"
+            if options.sname == "" or not options.sname: command = "UNKNOWN"
+        else: command = "UNKNOWN"
+    else:
+        print "unknown ghs flag!"
+        parser.print_help()
+        sys.exit(3)
+    if options.verbose: print command
+
+    if command == "UNKNOWN":
+        print "Unknown sh flag, or invalid combination."
+        print "Valid flag combinations are:"
+        print "hostgroup/[host|service]"
+        print "    Put all hosts or services in a hostgroup into downtime."
+        print "servicegroup/[host|service]"
+        print "    Put all hosts that have a servicegroup, or all services in that servicegroup into downtime."
+        print "host/[host|service]"
+        print "    Put a host, or all services on a host into downtime."
+        print "service/service"
+        print "    Put a single service on a host into downtime. [--sname required]"
+        parser.print_help()
+        sys.exit(3)
+
+    return (options, command)
+
+def parse_log():
+    if options.verbose: sys.stderr.write(">>DEBUG start - " + funcname() + 
+                            "()\n")
+    logFile = open(options.logfile)
+    start = 0
+    downtime = {}
+    downtime['host'] = {}
+    downtime['service'] = {}
+    for line in logFile.readlines():
+        if line.startswith('hostdowntime {'):
+            start = 'host'
+	elif line.startswith('servicedowntime {'):
+            start = 'service'
+        elif line.endswith('}'):
+	    start = 0
+	elif start != 0:
+	    if line.count('host_name'):
+                host = line.split('=')[1].strip()
+                if options.verbose:
+                    print host
+                service = None
+            if (start =='host') and (not downtime[start].has_key(host)):
+                downtime[start][host] = []
+	    if line.count('service_description'):
+                service = line.split('=')[1].strip()
+                if (start == 'service') and (not downtime[start].has_key(service)):
+                    downtime[start][service] = {}
+                if (start == 'service') and (not downtime[start][service].has_key(host)):
+                    downtime[start][service][host] = []
+                if options.verbose:
+                    print ">>", service
+	    if line.count('downtime_id'):
+                id = line.split('=')[1].strip()
+                if start == 'host':
+                    downtime[start][host].append(id)
+                elif start == 'service':
+                    downtime[start][service][host].append(id)
+    if options.verbose: sys.stderr.write(">>DEBUG end   - " + funcname() + 
+                            "()\n")
+    return downtime
+
+def remove_downtime(downtime):
+    if options.verbose: sys.stderr.write(">>DEBUG start - " + funcname() + 
+                            "()\n")
+    if (command == ('SCHEDULE_SVC_DOWNTIME')):
+        for host in downtime['service'][options.sname].keys():
+            if options.hname == host:
+                for id in downtime['service'][options.sname][host]:
+                    if options.verbose: print "[%s] DEL_SVC_DOWNTIME;%s" % (now, id)
+                    print >> spool, "[%s] DEL_SVC_DOWNTIME;%s" % (now, id)
+    elif (command == ('SCHEDULE_HOST_DOWNTIME')):
+        for host in downtime['host']:
+            if options.hname == host:
+                for id in downtime['host'][options.hname]:
+                    if options.verbose: print "[%s] DEL_HOST_DOWNTIME;%s" % (now, id)
+                    print >> spool, "[%s] DEL_HOST_DOWNTIME;%s" % (now, id)
+    elif (command == ('SCHEDULE_HOST_SVC_DOWNTIME')):
+        for service in downtime['service'].keys():
+            for host in downtime['service'][service].keys():
+                if options.hname == host:
+                    for id in downtime['service'][service][host]:
+                        if options.verbose: print "[%s] DEL_SVC_DOWNTIME;%s" % (now, id)
+                        print >> spool, "[%s] DEL_SVC_DOWNTIME;%s" % (now, id)
+    elif (command == ('SCHEDULE_HOSTGROUP_HOST_DOWNTIME')):
+        if objects is None:
+            print "Must validate against object cache for Hostgroup removal to work"
+            sys.exit(0)
+        for host in objects['hostgroup'][options.hname]['members'].split(','):
+            if host in downtime['host'].keys():
+                for id in downtime['host'][host]:
+                    if options.verbose: print "[%s] DEL_HOST_DOWNTIME;%s" % (now, id)
+                    print >> spool, "[%s] DEL_HOST_DOWNTIME;%s" % (now, id)
+    elif (command == ('SCHEDULE_HOSTGROUP_SVC_DOWNTIME')):
+        if objects is None:
+            print "Must validate against object cache for Hostgroup removal to work"
+            sys.exit(0)
+        hostlist = []
+        for host in objects['hostgroup'][options.hname]['members'].split(','):
+            hostlist.append(host)
+        for service in downtime['service'].keys():
+            for host in downtime['service'][service].keys():
+                if host in hostlist:
+                    for id in downtime['service'][service][host]:
+                        if options.verbose: print "[%s] DEL_SVC_DOWNTIME;%s" % (now, id)
+                        print >> spool, "[%s] DEL_SVC_DOWNTIME;%s" % (now, id)
+    elif (command == ('SCHEDULE_SERVICEGROUP_HOST_DOWNTIME')):
+        if objects is None:
+            print "Must validate against object cache for Servicegroup removal to work"
+            sys.exit(0)
+        for (host,) in servicegroup:
+            if host in downtime['host'].keys():
+                for id in downtime['host'][host]:
+                    if options.verbose: print "[%s] DEL_HOST_DOWNTIME;%s" % (now, id)
+                    print >> spool, "[%s] DEL_HOST_DOWNTIME;%s" % (now, id)
+    elif (command == ('SCHEDULE_SERVICEGROUP_SVC_DOWNTIME')):
+        if objects is None:
+            print "Must validate against object cache for Servicegroup removal to work"
+            sys.exit(0)
+        servicelist = {}
+        for (host, service) in servicegroup:
+            if service not in servicelist.keys():
+                servicelist[service] = []
+            if host not in servicelist[service]:
+                servicelist[service].append(host)
+        for service in downtime['service'].keys():
+            for host in downtime['service'][service].keys():
+                if service in servicelist.keys():
+                    if host in servicelist[service]:
+                        for id in downtime['service'][service][host]:
+                            if options.verbose: print "[%s] DEL_SVC_DOWNTIME;%s" % (now, id)
+                            print >> spool, "[%s] DEL_SVC_DOWNTIME;%s" % (now, id)
+        
+        
+    if options.verbose: sys.stderr.write(">>DEBUG end   - " + funcname() + 
+                            "()\n")
+
+def process_object(file):
+    """Read object file, sanitize and store in global variable."""
+    if options.verbose: sys.stderr.write(">>DEBUG start - " + funcname() + 
+                            "()\n")
+    object = {}
+    try:
+        object_lines = open(file).readlines()
+    except:
+        print("Tried to open cache file - fail")
+    else:
+        tag = ''
+        last = ''
+        for line in object_lines:
+            line = line.rstrip().lstrip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                if options.verbose and last != 'comment':
+                    last = 'comment'
+                continue
+            last = ''
+            # Here there be data!
+            if line.startswith('define'):
+                temp = {}
+                old_tag = tag
+                tag = line.split()[1]
+                if tag.endswith('status'):
+                    tag = tag.split('status')[0]
+                if tag != old_tag:
+                    tag_count = 1
+                else:
+                    tag_count += 1
+                if not object.has_key(tag):
+                    object[tag] = {}
+                continue
+            # Here ends data!
+            if line.endswith('}'):
+                if line != '}':
+                    (entry, value) = line.split('\t', 1)
+                    try:
+                        value = float(value)
+                    except:
+                        value = value.strip()
+                    temp[entry] = value
+                elif temp.has_key('%s_name' % (tag)):
+                    # Catchall for anything with *_name
+                    tag_name = temp.pop('%s_name' % (tag))
+                    object[tag][tag_name] = temp
+                elif temp.has_key('service_description'):
+                    # Services 
+                    if not temp.has_key('host_name'):
+                        temp['host_name'] = None
+                    host_name = temp.pop('host_name')
+                    if not object[tag].has_key(host_name):
+                        object[tag][host_name] = {}
+                    service = temp.pop('service_description')
+                    object[tag][host_name][service] = \
+                            temp
+            elif line:
+                (entry, value) = line.split('\t', 1)
+                try:
+                    value = float(value)
+                except:
+                    value = value.strip()
+                temp[entry] = value
+    if options.verbose: sys.stderr.write(">>DEBUG end   - " + funcname() + 
+                            "()\n")
+    return object
+
+def check_inputs(objects):
+    if options.verbose: sys.stderr.write(">>DEBUG start - " + funcname() + 
+                            "()\n")
+    exit = 0
+    if options.hname not in objects[options.ghs]:
+        print "Error no such %s, '%s'" % (options.ghs, options.hname)
+        exit = 1
+    else:
+        if options.verbose:
+            print "%s in %s" % (options.hname, options.ghs)
+
+    if options.ghs == options.sh == "service" and exit == 0:
+        if options.sname not in objects['service'][options.hname]:
+            print "Error, no such service on '%s'" % (options.hname)
+            print objects['service'][options.hname].keys()
+            exit = 1
+        else:
+            if options.verbose:
+                print "%s in %s" % (options.sname, options.hname)
+
+    if exit: sys.exit(0)
+            
+    if options.verbose: sys.stderr.write(">>DEBUG end   - " + funcname() + 
+                            "()\n")
+
+if __name__ == '__main__':
+    (options, command) = init()
+
+    try:
+        if options.verbose: print "Opening spool file"
+        spool = open(options.spoolfile, 'a')
+    except:
+        print "Spool file access error.  Perhaps you're not using sudo?"
+        sys.exit(3)
+
+    if options.object:
+        objects = process_object(options.object)
+        check_inputs(objects)
+    else:
+        objects = None
+
+
+    now = int(time.time())
+    begin = now + options.begin
+    end = begin + options.end
+
+    if options.remove:
+        try:
+            remove_downtime(parse_log())
+        except (KeyError):
+            print "Downtime not found."
+            raise
+        sys.exit(0)
+
+    if not options.sname:
+        print >> spool, ('[%i] %s;%s;%i;%i;%i;0;%i;%s;%s') % (now, command, options.hname,
+                begin, end, options.fixed, options.end, options.username, options.comment)
+        if options.verbose: print ('[%i] %s;%s;%i;%i;%i;0;%i;%s;%s') % (now, command, options.hname,
+                begin, end, options.fixed, options.end, options.username, options.comment)
+
+    else:
+        print >> spool, ('[%i] %s;%s;%s;%i;%i;%i;0;%i;%s;%s') % (now, command, options.hname,
+                options.sname, begin, end, options.fixed, options.end, options.username, options.comment)
+        if options.verbose: print ('[%i] %s;%s;%s;%i;%i;%i;0;%i;%s;%s') % (now, command, options.hname,
+                options.sname, begin, end, options.fixed, options.end, options.username, options.comment)
+
+    spool.close()
